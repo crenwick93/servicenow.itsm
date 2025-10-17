@@ -24,14 +24,14 @@ options:
     required: true
   interval:
     description:
-      - THe number of seconds to wait before performing another query.
+      - The number of seconds to wait before performing another query.
     required: false
     default: 5
   updated_since:
     description:
       - Specify the time that a record must be updated after to be considered new and captured by this plugin.
       - This value should be a date string in the format of "%Y-%m-%d %H:%M:%S".
-      - If not specified, the plugin will use the current time as a default. This means any records updated
+      - If not specified, the plugin will use the current UTC time as a default. This means any records updated
         after the plugin started will be captured.
     required: false
 """
@@ -48,7 +48,7 @@ EXAMPLES = r"""
           password: ansible
         table: change_request
         interval: 1
-        updated_since: "2025-08-13 12:00:00"
+        updated_since: "2025-08-13 12:00:00"  # UTC
 
   rules:
     - name: New record created
@@ -58,15 +58,13 @@ EXAMPLES = r"""
 """
 
 import asyncio
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 import datetime
 import logging
-
-# Need to add the project root to the path so that we can import the module_utils.
-# The EDA team may come up with a better solution for this in the future.
 import sys
 import os
 
+# Ensure module_utils imports resolve in EDA
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../.."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
@@ -76,8 +74,17 @@ from plugins.module_utils import client, table
 from plugins.module_utils.query import construct_sysparm_query_from_query
 from ansible.errors import AnsibleParserError
 
-
 logger = logging.getLogger(__name__)
+
+_DATETIME_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def _fmt(ts: datetime.datetime) -> str:
+    return ts.strftime(_DATETIME_FMT)
+
+
+def _utcnow_seconds() -> datetime.datetime:
+    return datetime.datetime.utcnow().replace(microsecond=0)
 
 
 class RecordsSource:
@@ -87,16 +94,20 @@ class RecordsSource:
             config_from_params=args.get("instance")
         )
 
-        self.table_name = args.get("table")
-        self.list_query = self.format_list_query(args)
-        self.interval = int(args.get("interval", 5))
-        self.updated_since = self.parse_string_to_datetime(args.get("updated_since"))
+        self.table_name: str = args.get("table")
+        self.list_query: Optional[Dict[str, str]] = self._format_list_query(args)
+        self.interval: int = int(args.get("interval", 5))
+        self.updated_since: datetime.datetime = self._parse_string_to_datetime(
+            args.get("updated_since")
+        )
 
         self.snow_client = client.Client(**self.instance_config)
         self.table_client = table.TableClient(self.snow_client)
-        self.previously_reported_records: Dict[str, str] = dict()
 
-    def format_list_query(self, args):
+        # Track last emitted sys_updated_on per sys_id (across cycles)
+        self.previously_reported_records: Dict[str, str] = {}
+
+    def _format_list_query(self, args: Dict[str, Any]) -> Optional[Dict[str, str]]:
         if args.get("sysparm_query"):
             return {"sysparm_query": args.get("sysparm_query")}
 
@@ -108,7 +119,29 @@ class RecordsSource:
                 "sysparm_query": construct_sysparm_query_from_query(args.get("query"))
             }
         except ValueError as e:
-            raise AnsibleParserError("Unable to parse query: %s" % e)
+            raise AnsibleParserError(f"Unable to parse query: {e}")
+
+    def _build_bounded_query(
+        self, since: datetime.datetime, until: datetime.datetime
+    ) -> Dict[str, str]:
+        """
+        Build a sysparm_query bounded to (since, until] and sorted ascending.
+        If the user supplied a sysparm_query, AND the bounds to it.
+        """
+        lower = _fmt(since)
+        upper = _fmt(until)
+        bounds = f"sys_updated_on>{lower}^sys_updated_on<={upper}"
+        ordering = "ORDERBYsys_updated_on^ORDERBYsys_id"
+
+        if self.list_query and self.list_query.get("sysparm_query"):
+            base = self.list_query["sysparm_query"].strip()
+            has_orderby = "ORDERBY" in base or "ORDERBYDESC" in base
+            combined = f"{base}^{bounds}"
+            if not has_orderby:
+                combined = f"{combined}^{ordering}"
+            return {"sysparm_query": combined}
+
+        return {"sysparm_query": f"{bounds}^{ordering}"}
 
     async def start_polling(self):
         while True:
@@ -117,38 +150,39 @@ class RecordsSource:
             await asyncio.sleep(self.interval)
 
     async def _poll_for_records(self):
-        # Mark the start of this poll. We'll advance the since timestamp (cursor)
-        # at the end to a safe value: max(poll_start_floor, newest_seen_this_poll).
-        poll_start = datetime.datetime.now()
-        poll_start_floor = poll_start.replace(microsecond=0)
-
-        reported_records: Dict[str, str] = dict()
-        newest_seen = self.updated_since  # start from current since timestamp (cursor)
+        # Bound this cycle to (updated_since, poll_start]
+        poll_start = _utcnow_seconds()
 
         logger.info(
-            "Polling for new records in %s since %s",
+            "Polling for new records in %s since %s (until %s)",
             self.table_name,
             self.updated_since,
+            poll_start,
         )
 
-        for record in self.table_client.list_records(self.table_name, self.list_query):
-            await self.process_record(record, reported_records)
-            # Track the newest timestamp actually observed this cycle
+        bounded_query = self._build_bounded_query(self.updated_since, poll_start)
+
+        # Within-cycle de-dupe: latest sys_updated_on per sys_id this cycle
+        emitted_this_poll: Dict[str, str] = {}
+
+        newest_seen = self.updated_since
+
+        for record in self.table_client.list_records(self.table_name, bounded_query):
+            await self._process_record(record, emitted_this_poll)
+
             try:
-                ts = self.parse_string_to_datetime(record["sys_updated_on"])
+                ts = self._parse_string_to_datetime(record.get("sys_updated_on"))
                 if ts > newest_seen:
                     newest_seen = ts
             except Exception:
-                # If a record has an unexpected timestamp format, ignore it for advancing the since timestamp
+                # Ignore malformed timestamps for advancing since
                 pass
 
-        self.previously_reported_records = reported_records
+        # Remember last version per sys_id emitted this cycle
+        self.previously_reported_records = emitted_this_poll
 
-        # Compute next 'since' timestamp (lower bound/cursor for next poll):
-        # - never in the future
-        # - aligned to seconds
-        # - monotonically non-decreasing
-        next_since = max(newest_seen, poll_start_floor)
+        # Advance since monotonically, never into the future
+        next_since = max(newest_seen, poll_start)
         if next_since > self.updated_since:
             logger.debug(
                 "Advancing since timestamp: %s -> %s", self.updated_since, next_since
@@ -161,39 +195,45 @@ class RecordsSource:
                 self.updated_since,
             )
 
-    async def process_record(self, record, reported_records):
-        # Ignore anything strictly older than our since timestamp.
-        if self.parse_string_to_datetime(record["sys_updated_on"]) < self.updated_since:
+    async def _process_record(
+        self, record: Dict[str, Any], emitted_this_poll: Dict[str, str]
+    ):
+        sys_id = record.get("sys_id")
+        updated_on = record.get("sys_updated_on")
+        if not sys_id or not updated_on:
             return
 
-        if self.has_record_been_reported(record):
-            # Already reported in the immediately previous cycle.
+        rec_ts = self._parse_string_to_datetime(updated_on)
+        # Enforce lower bound strictly inside the cycle; upper bound is handled by the query
+        if rec_ts <= self.updated_since:
             return
-        else:
-            # Not reported yet: remember it for this cycle and emit.
-            reported_records[record["sys_id"]] = record["sys_updated_on"]
-            await self.queue.put(record)
 
-    def has_record_been_reported(self, record):
-        if record["sys_id"] in self.previously_reported_records:
-            if (
-                record["sys_updated_on"]
-                == self.previously_reported_records[record["sys_id"]]
-            ):
-                return True
-        return False
+        # Within-cycle de-dupe (same version of same record in one poll)
+        if emitted_this_poll.get(sys_id) == updated_on:
+            return
 
-    def parse_string_to_datetime(self, date_string: str = None):
-        format_string = "%Y-%m-%d %H:%M:%S"
+        # Cross-cycle de-dupe (same version already emitted last cycle)
+        if self.previously_reported_records.get(sys_id) == updated_on:
+            return
+
+        # Record emission and remember latest version seen this cycle
+        emitted_this_poll[sys_id] = updated_on
+        await self.queue.put(record)
+
+    def _parse_string_to_datetime(
+        self, date_string: Optional[str] = None
+    ) -> datetime.datetime:
+        """
+        Parse ServiceNow UTC 'YYYY-MM-DD HH:MM:SS' into naive datetime (UTC).
+        When None, return current UTC at second precision.
+        """
         if date_string is None:
-            # Truncate to whole seconds to match ServiceNow precision
-            return datetime.datetime.now().replace(microsecond=0)
+            return _utcnow_seconds()
 
         try:
-            # ServiceNow returns second-precision strings (no microseconds)
-            return datetime.datetime.strptime(date_string, format_string)
+            return datetime.datetime.strptime(date_string, _DATETIME_FMT)
         except ValueError:
-            raise ValueError("Invalid date string: %s" % date_string)
+            raise ValueError(f"Invalid date string: {date_string}")
 
 
 # Entrypoint from ansible-rulebook
